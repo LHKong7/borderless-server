@@ -255,6 +255,9 @@ func setupRoutes(router *gin.Engine, healthHandler *handlers.HealthHandler, user
 				projectBuilds.POST("/claude", buildHandler.StartBuildWithClaude)
 				projectBuilds.GET("", buildHandler.GetProjectBuilds)
 			}
+
+			// Project chat SSE (Claude)
+			projects.POST("/:id/chat", chatHandler.StreamClaudeChat)
 		}
 	}
 

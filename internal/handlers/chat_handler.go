@@ -1,11 +1,18 @@
 package handlers
 
 import (
+	"bufio"
+	"encoding/json"
 	"net/http"
+	"os"
+	"os/exec"
 	"strconv"
+	"time"
 
+	"borderless_coding_server/config"
 	"borderless_coding_server/internal/models"
 	"borderless_coding_server/internal/services"
+	"borderless_coding_server/pkg/database"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -26,37 +33,37 @@ func NewChatHandler(chatService *services.ChatService, logger *logrus.Logger) *C
 
 // CreateChatSessionRequest represents the request payload for creating a chat session
 type CreateChatSessionRequest struct {
-	UserID     uuid.UUID      `json:"user_id" binding:"required"`
-	ProjectID  *uuid.UUID     `json:"project_id"`
-	Title      *string        `json:"title"`
-	ModelHint  *string        `json:"model_hint"`
-	Meta       models.JSONB   `json:"meta"`
+	UserID    uuid.UUID    `json:"user_id" binding:"required"`
+	ProjectID *uuid.UUID   `json:"project_id" binding:"required"`
+	Title     *string      `json:"title"`
+	ModelHint *string      `json:"model_hint"`
+	Meta      models.JSONB `json:"meta"`
 }
 
 // UpdateChatSessionRequest represents the request payload for updating a chat session
 type UpdateChatSessionRequest struct {
 	Title     *string      `json:"title"`
 	ModelHint *string      `json:"model_hint"`
-	Meta      models.JSONB  `json:"meta"`
+	Meta      models.JSONB `json:"meta"`
 }
 
 // CreateChatMessageRequest represents the request payload for creating a chat message
 type CreateChatMessageRequest struct {
-	SessionID  uuid.UUID      `json:"session_id" binding:"required"`
+	SessionID  uuid.UUID         `json:"session_id" binding:"required"`
 	Sender     models.ChatSender `json:"sender" binding:"required"`
-	Text       *string        `json:"text"`
-	Content    models.JSONB    `json:"content"`
-	TokensUsed *int           `json:"tokens_used"`
-	ToolName   *string        `json:"tool_name"`
-	ReplyTo    *uuid.UUID     `json:"reply_to"`
+	Text       *string           `json:"text"`
+	Content    models.JSONB      `json:"content"`
+	TokensUsed *int              `json:"tokens_used"`
+	ToolName   *string           `json:"tool_name"`
+	ReplyTo    *uuid.UUID        `json:"reply_to"`
 }
 
 // UpdateChatMessageRequest represents the request payload for updating a chat message
 type UpdateChatMessageRequest struct {
-	Text       *string     `json:"text"`
+	Text       *string      `json:"text"`
 	Content    models.JSONB `json:"content"`
-	TokensUsed *int        `json:"tokens_used"`
-	ToolName   *string     `json:"tool_name"`
+	TokensUsed *int         `json:"tokens_used"`
+	ToolName   *string      `json:"tool_name"`
 }
 
 // CreateChatSession creates a new chat session
@@ -67,9 +74,14 @@ func (h *ChatHandler) CreateChatSession(c *gin.Context) {
 		return
 	}
 
+	if req.ProjectID == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "project_id is required"})
+		return
+	}
+
 	session := &models.ChatSession{
 		UserID:    req.UserID,
-		ProjectID: req.ProjectID,
+		ProjectID: *req.ProjectID,
 		Title:     req.Title,
 		ModelHint: req.ModelHint,
 		Meta:      req.Meta,
@@ -494,4 +506,202 @@ func (h *ChatHandler) GetRecentChatSessions(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"sessions": sessions})
+}
+
+// StreamClaudeChatRequest represents the chat streaming request
+type StreamClaudeChatRequest struct {
+	Message string `json:"message" binding:"required"`
+}
+
+// StreamClaudeChat streams Claude CLI output for a project's single chat session (SSE)
+func (h *ChatHandler) StreamClaudeChat(c *gin.Context) {
+	// Auth user
+	userIDInterface, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+	userID, ok := userIDInterface.(uuid.UUID)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
+	// Project ID
+	projectIDStr := c.Param("id")
+	projectID, err := uuid.Parse(projectIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid project ID"})
+		return
+	}
+
+	// Ownership check
+	var project models.Project
+	if err := database.DB.Where("id = ? AND owner_id = ? AND deleted_at IS NULL", projectID, userID).First(&project).Error; err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Project not found or not owned by user"})
+		return
+	}
+
+	// Get or create one-to-one chat session for project
+	var session models.ChatSession
+	if err := database.DB.Where("project_id = ?", projectID).First(&session).Error; err != nil {
+		// create
+		session = models.ChatSession{UserID: userID, ProjectID: projectID}
+		if err := database.DB.Create(&session).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create chat session"})
+			return
+		}
+	}
+
+	// Parse request
+	var req StreamClaudeChatRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Persist user message
+	userMsg := models.ChatMessage{SessionID: session.ID, Sender: models.ChatSenderUser, Text: &req.Message, Content: models.JSONB{"text": req.Message}}
+	if err := database.DB.Create(&userMsg).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save message"})
+		return
+	}
+
+	// Determine working directory from StorageLocation (local_fs) or fallback
+	var storage models.StorageLocation
+	workDir := ""
+	if err := database.DB.Where("project_id = ?", projectID).First(&storage).Error; err == nil && storage.LocalPath != nil {
+		workDir = *storage.LocalPath
+		// Ensure directory exists for local filesystem storage
+		if storage.Type == models.StorageTypeLocalFS {
+			_ = os.MkdirAll(workDir, 0755)
+		}
+	}
+	if workDir == "" {
+		// fallback temp path
+		workDir = "/tmp/borderless-coding/chat/" + userID.String() + "/" + projectID.String()
+		_ = os.MkdirAll(workDir, 0755)
+	}
+
+	h.logger.Info("workDir is ...", workDir)
+
+	// Prepare SSE headers
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Streaming not supported"})
+		return
+	}
+
+	// Spawn Claude CLI
+	args := []string{"--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "-p", req.Message}
+	claudePath := config.LoadConfig().ClaudeCLIPath
+	if claudePath == "" {
+		claudePath = "claude"
+	}
+	cmd := exec.CommandContext(c.Request.Context(), claudePath, args...)
+	cmd.Dir = workDir
+	h.logger.WithField("cmd", append([]string{claudePath}, args...)).Info("starting claude cli")
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to attach stdout"})
+		return
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to attach stderr"})
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start Claude CLI"})
+		return
+	}
+
+	type line struct {
+		isErr bool
+		text  string
+	}
+	outCh := make(chan line, 128)
+	done := make(chan struct{})
+
+	// Readers
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			outCh <- line{isErr: false, text: scanner.Text()}
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			outCh <- line{isErr: true, text: scanner.Text()}
+		}
+		done <- struct{}{}
+	}()
+
+	// Wait for readers and process output synchronously to keep connection open
+	assistantAccum := ""
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	readersClosed := 0
+	for {
+		select {
+		case l := <-outCh:
+			if l.text == "" {
+				continue
+			}
+			if l.isErr {
+				c.Writer.WriteString("event: claude_error\n")
+				b, _ := json.Marshal(gin.H{"error": l.text})
+				c.Writer.WriteString("data: " + string(b) + "\n\n")
+				flusher.Flush()
+				continue
+			}
+			var payload map[string]interface{}
+			if err := json.Unmarshal([]byte(l.text), &payload); err == nil {
+				if t, ok := payload["text"].(string); ok {
+					assistantAccum += t
+				}
+				c.Writer.WriteString("event: claude_response\n")
+				b, _ := json.Marshal(payload)
+				c.Writer.WriteString("data: " + string(b) + "\n\n")
+			} else {
+				assistantAccum += l.text + "\n"
+				c.Writer.WriteString("event: claude_output\n")
+				b, _ := json.Marshal(gin.H{"data": l.text})
+				c.Writer.WriteString("data: " + string(b) + "\n\n")
+			}
+			flusher.Flush()
+		case <-done:
+			readersClosed++
+			if readersClosed >= 2 {
+				// All readers done; wait for process
+				_ = cmd.Wait()
+				// Persist assistant message
+				if assistantAccum != "" {
+					content := models.JSONB{"text": assistantAccum}
+					msg := models.ChatMessage{SessionID: session.ID, Sender: models.ChatSenderAssistant, Text: &assistantAccum, Content: content}
+					_ = database.DB.Create(&msg).Error
+				}
+				c.Writer.WriteString("event: complete\n")
+				c.Writer.WriteString("data: {}\n\n")
+				flusher.Flush()
+				return
+			}
+		case <-ticker.C:
+			// keepalive
+			c.Writer.WriteString("event: keepalive\n")
+			c.Writer.WriteString("data: {}\n\n")
+			flusher.Flush()
+		case <-c.Request.Context().Done():
+			_ = cmd.Process.Kill()
+			return
+		}
+	}
 }

@@ -101,7 +101,37 @@ func (h *ProjectHandler) GetProject(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"project": project})
+	// Prepare enriched response
+	var chatSessionID *uuid.UUID
+	if project.ChatSession != nil {
+		chatSessionID = &project.ChatSession.ID
+	}
+
+	var storage any
+	if project.StorageLocation != nil {
+		storage = gin.H{
+			"type":         project.StorageLocation.Type,
+			"git_url":      project.StorageLocation.GitURL,
+			"git_branch":   project.StorageLocation.GitBranch,
+			"local_path":   project.StorageLocation.LocalPath,
+			"network_path": project.StorageLocation.NetworkPath,
+		}
+	}
+
+	var build any
+	if project.BuildResult != nil {
+		build = gin.H{
+			"built_url": project.BuildResult.BuiltURL,
+			"meta":      project.BuildResult.Meta,
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"project":          project,
+		"chat_session_id":  chatSessionID,
+		"storage_location": storage,
+		"build_result":     build,
+	})
 }
 
 // GetProjectBySlug retrieves a project by slug
@@ -199,6 +229,18 @@ func (h *ProjectHandler) DeleteProject(c *gin.Context) {
 
 // ListProjects retrieves a paginated list of projects
 func (h *ProjectHandler) ListProjects(c *gin.Context) {
+	// Always scope to the authenticated user
+	userIDInterface, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+	userID, ok := userIDInterface.(uuid.UUID)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
 	offsetStr := c.DefaultQuery("offset", "0")
 	limitStr := c.DefaultQuery("limit", "10")
 
@@ -212,12 +254,8 @@ func (h *ProjectHandler) ListProjects(c *gin.Context) {
 		limit = 10
 	}
 
-	var ownerID *uuid.UUID
-	if ownerIDStr := c.Query("owner_id"); ownerIDStr != "" {
-		if parsedID, err := uuid.Parse(ownerIDStr); err == nil {
-			ownerID = &parsedID
-		}
-	}
+	// Force owner to current user
+	ownerID := &userID
 
 	var visibility *models.ProjectVisibility
 	if visibilityStr := c.Query("visibility"); visibilityStr != "" {

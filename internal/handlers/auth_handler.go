@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"borderless_coding_server/internal/models"
@@ -252,6 +253,9 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 
+	// Initialize an empty project for first-time login (best-effort, async)
+	go initUserDefaultProject(user, h.logger)
+
 	c.JSON(http.StatusOK, gin.H{
 		"message":        "login successful",
 		"user":           user,
@@ -368,6 +372,9 @@ func (h *AuthHandler) GoogleCallback(c *gin.Context) {
 		return
 	}
 
+	// Initialize an empty project for first-time login (best-effort, async)
+	go initUserDefaultProject(*user, h.logger)
+
 	c.JSON(http.StatusOK, gin.H{
 		"message":       "Authentication successful",
 		"user":          user,
@@ -375,6 +382,58 @@ func (h *AuthHandler) GoogleCallback(c *gin.Context) {
 		"refresh_token": refreshToken,
 		"expires_in":    15 * 60, // 15 minutes in seconds
 	})
+}
+
+// initUserDefaultProject ensures the user has at least one project; if none, creates a default one.
+func initUserDefaultProject(user models.User, logger *logrus.Logger) {
+	// Check if the user already has projects
+	var count int64
+	if err := database.DB.Model(&models.Project{}).Where("owner_id = ? AND deleted_at IS NULL", user.ID).Count(&count).Error; err != nil {
+		return
+	}
+	if count > 0 {
+		return
+	}
+
+	// Build a default project name
+	var base string
+	if user.DisplayName != nil && *user.DisplayName != "" {
+		base = *user.DisplayName
+	} else if user.Email != nil && *user.Email != "" {
+		if i := strings.Index(*user.Email, "@"); i > 0 {
+			base = (*user.Email)[:i]
+		}
+	}
+	if base == "" {
+		base = "my"
+	}
+	defaultName := base + "-project"
+
+	// Try to create with increasing suffix if needed
+	svc := services.NewProjectService()
+	name := defaultName
+	for i := 0; i < 5; i++ {
+		project := &models.Project{OwnerID: user.ID, Name: name}
+		if err := svc.CreateProject(project); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "already exists") {
+				name = defaultName + "-" + string('2'+i)
+				continue
+			}
+			return
+		}
+
+		// Create default storage location: local filesystem path workspaces/<username>/<project_id>
+		sanitized := strings.ToLower(strings.ReplaceAll(base, " ", "-"))
+		if sanitized == "" {
+			sanitized = "user"
+		}
+		locPath := config.LoadConfig().LocalStoragePath + "/" + sanitized + "/" + project.ID.String()
+		logger.Info("local storage path is ...", locPath)
+
+		loc := models.StorageLocation{ProjectID: project.ID, Type: models.StorageTypeLocalFS, LocalPath: &locPath}
+		_ = database.DB.Create(&loc).Error
+		return
+	}
 }
 
 // RefreshToken refreshes the access token using a refresh token

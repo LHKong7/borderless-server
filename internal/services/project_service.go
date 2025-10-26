@@ -59,7 +59,11 @@ func (s *ProjectService) CreateProject(project *models.Project) error {
 // GetProjectByID retrieves a project by ID
 func (s *ProjectService) GetProjectByID(id uuid.UUID) (*models.Project, error) {
 	var project models.Project
-	err := database.DB.Where("id = ? AND deleted_at IS NULL", id).First(&project).Error
+	err := database.DB.
+		Preload("StorageLocation").
+		Preload("ChatSession").
+		Preload("BuildResult").
+		Where("id = ? AND deleted_at IS NULL", id).First(&project).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, errors.New("project not found")
@@ -96,7 +100,7 @@ func (s *ProjectService) UpdateProject(id uuid.UUID, updates map[string]interfac
 	// Check for name conflicts if name is being updated
 	if name, exists := updates["name"]; exists {
 		var existingProject models.Project
-		if err := database.DB.Where("owner_id = ? AND name = ? AND id != ? AND deleted_at IS NULL", 
+		if err := database.DB.Where("owner_id = ? AND name = ? AND id != ? AND deleted_at IS NULL",
 			project.OwnerID, name, id).First(&existingProject).Error; err == nil {
 			return errors.New("project name already exists for this owner")
 		}
@@ -185,7 +189,7 @@ func (s *ProjectService) UpdateProjectStorageQuota(id uuid.UUID, quotaBytes int6
 func (s *ProjectService) SearchProjects(query string, ownerID *uuid.UUID, visibility *models.ProjectVisibility, limit int) ([]models.Project, error) {
 	var projects []models.Project
 
-	dbQuery := database.DB.Where("deleted_at IS NULL AND (name ILIKE ? OR description ILIKE ?)", 
+	dbQuery := database.DB.Where("deleted_at IS NULL AND (name ILIKE ? OR description ILIKE ?)",
 		"%"+query+"%", "%"+query+"%")
 
 	// Filter by owner if specified
@@ -227,14 +231,14 @@ func (s *ProjectService) GenerateSlug(name string) string {
 	slug := strings.ToLower(name)
 	slug = strings.ReplaceAll(slug, " ", "-")
 	slug = strings.ReplaceAll(slug, "_", "-")
-	
+
 	// Remove multiple consecutive hyphens
 	for strings.Contains(slug, "--") {
 		slug = strings.ReplaceAll(slug, "--", "-")
 	}
-	
+
 	// Remove leading/trailing hyphens
 	slug = strings.Trim(slug, "-")
-	
+
 	return slug
 }

@@ -62,6 +62,12 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'token_purpose') THEN
         CREATE TYPE token_purpose AS ENUM ('email_verify','email_login','phone_verify','phone_login','reset_password');
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'user_level') THEN
+        CREATE TYPE user_level AS ENUM ('free','entry','senior','staff','principal');
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'storage_type') THEN
+        CREATE TYPE storage_type AS ENUM ('git_remote','local_fs','network_fs');
+    END IF;
 END$$;`).Error; err != nil {
 		log.Printf("Warning: Could not ensure custom enums: %v", err)
 	}
@@ -89,6 +95,8 @@ func AutoMigrate() error {
 		&models.ChatMessage{},
 		&models.Build{},
 		&models.BuildLog{},
+		&models.StorageLocation{},
+		&models.BuildResult{},
 	)
 
 	if err != nil {

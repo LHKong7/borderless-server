@@ -52,6 +52,9 @@ type Config struct {
 	// Password Encryption (client→server RSA)
 	PasswordEncPublicKey  string
 	PasswordEncPrivateKey string
+
+	// local storage
+	LocalStoragePath string
 }
 
 func LoadConfig() *Config {
@@ -103,6 +106,9 @@ func LoadConfig() *Config {
 		// Password Encryption (client→server RSA)
 		PasswordEncPublicKey:  loadPublicKey(),
 		PasswordEncPrivateKey: loadPrivateKey(),
+
+		// local storage
+		LocalStoragePath: getEnv("LOCAL_STORAGE_PATH", "workspaces"),
 	}
 
 	return config
@@ -150,14 +156,15 @@ func (c Config) String() string {
 			"    ClientSecret: %s\n"+
 			"    RedirectURL: %s\n"+
 			"  ClaudeCLI:\n"+
-			"    Path: %s",
+			"    Path: %s\n"+
+			"  LocalStoragePath:%s",
 		c.Port, c.GinMode,
 		c.DBHost, c.DBPort, c.DBUser, redact(c.DBPassword), c.DBName, c.DBSSLMode,
 		c.RedisHost, c.RedisPort, redact(c.RedisPassword), c.RedisDB,
 		c.MinIOEndpoint, redact(c.MinIOAccessKey), redact(c.MinIOSecretKey), c.MinIOUseSSL, c.MinIOBucketName,
 		redact(c.JWTSecret), c.JWTExpiration,
 		c.GoogleClientID, redact(c.GoogleClientSecret), c.GoogleRedirectURL,
-		c.ClaudeCLIPath,
+		c.ClaudeCLIPath, c.LocalStoragePath,
 	)
 }
 

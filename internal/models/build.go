@@ -119,3 +119,32 @@ func (bl *BuildLog) BeforeCreate(tx *gorm.DB) error {
 	bl.Timestamp = now
 	return nil
 }
+
+// BuildResult represents the one-to-one build artifact result for a project
+type BuildResult struct {
+	ID        uuid.UUID `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
+	ProjectID uuid.UUID `json:"project_id" gorm:"type:uuid;not null;unique"`
+	BuiltURL  string    `json:"built_url" gorm:"not null"` // MinIO (or S3) URL
+	Meta      JSONB     `json:"meta" gorm:"type:jsonb;default:'{}'"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+
+	Project Project `json:"project,omitempty" gorm:"foreignKey:ProjectID"`
+}
+
+func (BuildResult) TableName() string { return "build_results" }
+
+func (br *BuildResult) BeforeCreate(tx *gorm.DB) error {
+	if br.ID == uuid.Nil {
+		br.ID = uuid.New()
+	}
+	now := time.Now()
+	br.CreatedAt = now
+	br.UpdatedAt = now
+	return nil
+}
+
+func (br *BuildResult) BeforeUpdate(tx *gorm.DB) error {
+	br.UpdatedAt = time.Now()
+	return nil
+}

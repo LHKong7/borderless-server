@@ -34,15 +34,13 @@ func (s *ChatService) CreateChatSession(session *models.ChatSession) error {
 		return err
 	}
 
-	// Check if project exists (if specified)
-	if session.ProjectID != nil {
-		var project models.Project
-		if err := database.DB.Where("id = ? AND deleted_at IS NULL", *session.ProjectID).First(&project).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return errors.New("project not found")
-			}
-			return err
+	// Check if project exists (required one-to-one with project)
+	var project models.Project
+	if err := database.DB.Where("id = ? AND deleted_at IS NULL", session.ProjectID).First(&project).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errors.New("project not found")
 		}
+		return err
 	}
 
 	// Set default metadata if not provided

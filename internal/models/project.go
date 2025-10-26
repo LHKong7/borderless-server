@@ -34,8 +34,10 @@ type Project struct {
 	DeletedAt         gorm.DeletedAt    `json:"-" gorm:"index"`
 
 	// Relationships
-	Owner         User           `json:"owner,omitempty" gorm:"foreignKey:OwnerID"`
-	ChatSessions  []ChatSession  `json:"chat_sessions,omitempty" gorm:"foreignKey:ProjectID"`
+	Owner           User             `json:"owner,omitempty" gorm:"foreignKey:OwnerID"`
+	ChatSession     *ChatSession     `json:"chat_session,omitempty" gorm:"foreignKey:ProjectID;constraint:OnDelete:CASCADE"`
+	StorageLocation *StorageLocation `json:"storage_location,omitempty" gorm:"foreignKey:ProjectID;constraint:OnDelete:CASCADE"`
+	BuildResult     *BuildResult     `json:"build_result,omitempty" gorm:"foreignKey:ProjectID;constraint:OnDelete:CASCADE"`
 }
 
 // TableName returns the table name for the Project model
