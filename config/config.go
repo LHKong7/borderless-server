@@ -55,6 +55,9 @@ type Config struct {
 
 	// local storage
 	LocalStoragePath string
+
+	// Project template zip for initializing new projects
+	ProjectTemplateZip string
 }
 
 func LoadConfig() *Config {
@@ -108,7 +111,8 @@ func LoadConfig() *Config {
 		PasswordEncPrivateKey: loadPrivateKey(),
 
 		// local storage
-		LocalStoragePath: getEnv("LOCAL_STORAGE_PATH", "workspaces"),
+		LocalStoragePath:   getEnv("LOCAL_STORAGE_PATH", "workspaces"),
+		ProjectTemplateZip: getEnv("PROJECT_TEMPLATE_ZIP", "project_template.zip"),
 	}
 
 	return config

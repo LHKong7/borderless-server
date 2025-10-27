@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -13,6 +14,8 @@ import (
 	"borderless_coding_server/internal/models"
 	"borderless_coding_server/internal/services"
 	"borderless_coding_server/pkg/database"
+	"borderless_coding_server/pkg/storage"
+	"borderless_coding_server/pkg/utils"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -568,12 +571,12 @@ func (h *ChatHandler) StreamClaudeChat(c *gin.Context) {
 	}
 
 	// Determine working directory from StorageLocation (local_fs) or fallback
-	var storage models.StorageLocation
+	var storageLoc models.StorageLocation
 	workDir := ""
-	if err := database.DB.Where("project_id = ?", projectID).First(&storage).Error; err == nil && storage.LocalPath != nil {
-		workDir = *storage.LocalPath
+	if err := database.DB.Where("project_id = ?", projectID).First(&storageLoc).Error; err == nil && storageLoc.LocalPath != nil {
+		workDir = *storageLoc.LocalPath
 		// Ensure directory exists for local filesystem storage
-		if storage.Type == models.StorageTypeLocalFS {
+		if storageLoc.Type == models.StorageTypeLocalFS {
 			_ = os.MkdirAll(workDir, 0755)
 		}
 	}
@@ -581,6 +584,41 @@ func (h *ChatHandler) StreamClaudeChat(c *gin.Context) {
 		// fallback temp path
 		workDir = "/tmp/borderless-coding/chat/" + userID.String() + "/" + projectID.String()
 		_ = os.MkdirAll(workDir, 0755)
+	}
+
+	// Sync from MinIO if network path exists; otherwise initialize from template
+	if storageLoc.NetworkPath != nil && *storageLoc.NetworkPath != "" {
+		// Download zip to temp, unzip into workDir
+		tmpZip := workDir + "/.remote.zip"
+		// NetworkPath format: bucket/objectKey
+		bucket, object := parseMinIOPath(*storageLoc.NetworkPath)
+		if bucket == "" || object == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid network path"})
+			return
+		}
+		// Download to tmp and unzip
+		if err := storage.DownloadFile(c.Request.Context(), bucket, object, tmpZip); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "failed to download remote archive"})
+			return
+		}
+		if err := utils.UnZipFile(tmpZip, workDir); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid zip archive"})
+			os.Remove(tmpZip)
+			return
+		}
+		_ = os.Remove(tmpZip)
+	} else {
+		// New user: copy project_template.zip into workDir and unzip
+		templateZip := config.LoadConfig().ProjectTemplateZip
+		if templateZip == "" {
+			templateZip = "project_template.zip"
+		}
+		if _, err := os.Stat(templateZip); err == nil {
+			if err := utils.UnZipFile(templateZip, workDir); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initialize template"})
+				return
+			}
+		}
 	}
 
 	h.logger.Info("workDir is ...", workDir)
@@ -689,6 +727,36 @@ func (h *ChatHandler) StreamClaudeChat(c *gin.Context) {
 					msg := models.ChatMessage{SessionID: session.ID, Sender: models.ChatSenderAssistant, Text: &assistantAccum, Content: content}
 					_ = database.DB.Create(&msg).Error
 				}
+				// Git commit changes with chat message (best effort)
+				_ = runGitCommit(workDir, req.Message)
+				// Zip and upload back to MinIO (compose path if empty)
+				composedPath := getOrComposeNetworkPath(&storageLoc, userID, projectID, session.ID)
+				bucket, object := parseMinIOPath(composedPath)
+				tmpZip := filepath.Join(os.TempDir(), "upload-"+projectID.String()+".zip")
+				if err := utils.ZipFolder(workDir, tmpZip); err != nil {
+					h.logger.WithError(err).Error("zip failed")
+					c.Writer.WriteString("event: upload_error\n")
+					b, _ := json.Marshal(gin.H{"error": "zip failed"})
+					c.Writer.WriteString("data: " + string(b) + "\n\n")
+					flusher.Flush()
+				} else {
+					if err := storage.UploadFile(c.Request.Context(), bucket, object, tmpZip); err != nil {
+						h.logger.WithError(err).Error("upload failed")
+						c.Writer.WriteString("event: upload_error\n")
+						b, _ := json.Marshal(gin.H{"error": "upload failed"})
+						c.Writer.WriteString("data: " + string(b) + "\n\n")
+						flusher.Flush()
+					} else {
+						// Persist composed network path if it was empty before
+						if storageLoc.NetworkPath == nil || *storageLoc.NetworkPath == "" {
+							np := composedPath
+							_ = database.DB.Model(&models.StorageLocation{}).Where("id = ?", storageLoc.ID).Update("network_path", np).Error
+						}
+					}
+					_ = os.Remove(tmpZip)
+				}
+				// Cleanup local folder
+				_ = os.RemoveAll(workDir)
 				c.Writer.WriteString("event: complete\n")
 				c.Writer.WriteString("data: {}\n\n")
 				flusher.Flush()
@@ -704,4 +772,49 @@ func (h *ChatHandler) StreamClaudeChat(c *gin.Context) {
 			return
 		}
 	}
+}
+
+// parseMinIOPath expects "bucket/objectKey"
+func parseMinIOPath(p string) (string, string) {
+	for i := 0; i < len(p); i++ {
+		if p[i] == '/' {
+			return p[:i], p[i+1:]
+		}
+	}
+	return "", ""
+}
+
+func getOrComposeNetworkPath(loc *models.StorageLocation, userID, projectID, sessionID uuid.UUID) string {
+	if loc != nil && loc.NetworkPath != nil && *loc.NetworkPath != "" {
+		return *loc.NetworkPath
+	}
+	// Default bucket from config, path composed
+	cfg := config.LoadConfig()
+	bucket := cfg.MinIOBucketName
+	object := "users/" + userID.String() + "/projects/" + projectID.String() + "/sessions/" + sessionID.String() + ".zip"
+	np := bucket + "/" + object
+	return np
+}
+
+func runGitCommit(dir, message string) error {
+	// Initialize repo if needed
+	if _, err := os.Stat(dir + "/.git"); os.IsNotExist(err) {
+		cmd := exec.Command("git", "init")
+		cmd.Dir = dir
+		_ = cmd.Run()
+	}
+	// Add all
+	cmdAdd := exec.Command("git", "add", ".")
+	cmdAdd.Dir = dir
+	if err := cmdAdd.Run(); err != nil {
+		return err
+	}
+	// Commit
+	if message == "" {
+		message = "update via chat"
+	}
+	cmdCommit := exec.Command("git", "commit", "-m", message)
+	cmdCommit.Dir = dir
+	_ = cmdCommit.Run() // best effort
+	return nil
 }
