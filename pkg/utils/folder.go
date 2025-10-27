@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 func CreateFolderIfNotExists(path string) error {
@@ -129,13 +130,36 @@ func ZipFolder(srcDir, destZip string) error {
 			return nil
 		}
 
+		// Skip VCS and junk files
+		base := filepath.Base(path)
+		if base == ".git" {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if base == ".DS_Store" || base == "Thumbs.db" {
+			return nil
+		}
+
+		// Skip symlinks
+		if info.Mode()&os.ModeSymlink != 0 {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
 		header, err := zip.FileInfoHeader(info)
 		if err != nil {
 			return err
 		}
-		header.Name = rel
+		// Ensure forward slashes for cross-platform compatibility (macOS Finder)
+		header.Name = strings.ReplaceAll(rel, string(filepath.Separator), "/")
 		if info.IsDir() {
 			header.Name += "/"
+		} else {
+			header.Method = zip.Deflate
 		}
 
 		writer, err := zipWriter.CreateHeader(header)
