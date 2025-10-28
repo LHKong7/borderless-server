@@ -90,7 +90,7 @@ func main() {
 	buildHandler := handlers.NewBuildHandler(buildService, logger)
 
 	// Setup routes
-	setupRoutes(router, healthHandler, userHandler, projectHandler, chatHandler, authHandler, buildHandler, jwtService)
+	setupRoutes(router, healthHandler, userHandler, projectHandler, chatHandler, authHandler, buildHandler, jwtService, cfg)
 
 	// Create HTTP server
 	server := &http.Server{
@@ -123,11 +123,14 @@ func main() {
 	logger.Info("Server exited")
 }
 
-func setupRoutes(router *gin.Engine, healthHandler *handlers.HealthHandler, userHandler *handlers.UserHandler, projectHandler *handlers.ProjectHandler, chatHandler *handlers.ChatHandler, authHandler *handlers.AuthHandler, buildHandler *handlers.BuildHandler, jwtService *services.JWTService) {
+func setupRoutes(router *gin.Engine, healthHandler *handlers.HealthHandler, userHandler *handlers.UserHandler, projectHandler *handlers.ProjectHandler, chatHandler *handlers.ChatHandler, authHandler *handlers.AuthHandler, buildHandler *handlers.BuildHandler, jwtService *services.JWTService, cfg *config.Config) {
 	// Health check routes
 	router.GET("/health", healthHandler.HealthCheck)
 	router.GET("/health/ready", healthHandler.ReadinessCheck)
 	router.GET("/health/live", healthHandler.LivenessCheck)
+
+	// Serve static preview files
+	router.Static("/static", cfg.StaticFolderPath)
 
 	// Authentication routes (public)
 	auth := router.Group("/auth")
@@ -258,6 +261,10 @@ func setupRoutes(router *gin.Engine, healthHandler *handlers.HealthHandler, user
 
 			// Project chat SSE (Claude)
 			projects.POST("/:id/chat", chatHandler.StreamClaudeChat)
+
+			// Project preview build
+			projects.POST("/:id/preview", projectHandler.BuildPreview)
+
 		}
 	}
 

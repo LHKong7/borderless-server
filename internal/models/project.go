@@ -28,6 +28,7 @@ type Project struct {
 	RootPrefix        string            `json:"root_prefix" gorm:"not null"`
 	StorageQuotaBytes int64             `json:"storage_quota_bytes" gorm:"default:0"`
 	Meta              JSONB             `json:"meta" gorm:"type:jsonb;default:'{}'"`
+	PreviewURL        *string           `json:"preview_url"`
 	Version           int               `json:"version" gorm:"default:1"`
 	CreatedAt         time.Time         `json:"created_at"`
 	UpdatedAt         time.Time         `json:"updated_at"`

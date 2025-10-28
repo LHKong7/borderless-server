@@ -29,81 +29,65 @@ func CreateZipFile(path string) error {
 
 // UnZipFile extracts a zip archive (zipPath) into the destination directory (destPath)
 func UnZipFile(zipPath, destPath string) error {
-	zipReader, err := zip.OpenReader(zipPath)
+	r, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return err
 	}
-	defer zipReader.Close()
+	defer r.Close()
 
-	for _, file := range zipReader.File {
-		fpath := destPath + string(os.PathSeparator) + file.Name
+	if err := os.MkdirAll(destPath, 0755); err != nil {
+		return err
+	}
+	destAbs, err := filepath.Abs(destPath)
+	if err != nil {
+		return err
+	}
 
-		// Prevent ZipSlip vulnerability
-		if !isPathSafe(destPath, fpath) {
+	for _, f := range r.File {
+		// Normalize to forward slashes
+		name := strings.ReplaceAll(f.Name, "\\", "/")
+		targetPath := filepath.Join(destPath, name)
+		targetAbs, err := filepath.Abs(targetPath)
+		if err != nil {
+			return err
+		}
+		// ZipSlip protection
+		if !strings.HasPrefix(targetAbs, destAbs+string(os.PathSeparator)) && targetAbs != destAbs {
 			return err
 		}
 
-		if file.FileInfo().IsDir() {
-			if err := os.MkdirAll(fpath, file.Mode()); err != nil {
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(targetAbs, f.Mode()); err != nil {
 				return err
 			}
 			continue
 		}
 
-		// Make sure directories exist
-		if err := os.MkdirAll(getParentDir(fpath), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(targetAbs), 0755); err != nil {
 			return err
 		}
 
-		rc, err := file.Open()
+		rc, err := f.Open()
 		if err != nil {
 			return err
 		}
-		defer rc.Close()
 
-		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
+		outFile, err := os.OpenFile(targetAbs, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
 		if err != nil {
 			rc.Close()
 			return err
 		}
 
-		_, err = io.Copy(outFile, rc)
-		outFile.Close()
-		rc.Close()
-		if err != nil {
+		if _, err := io.Copy(outFile, rc); err != nil {
+			outFile.Close()
+			rc.Close()
 			return err
 		}
+		outFile.Close()
+		rc.Close()
 	}
 
 	return nil
-}
-
-// isPathSafe checks for ZipSlip vulnerability by ensuring the resulting
-// unpacked path is within the destination directory
-func isPathSafe(dest, target string) bool {
-	destAbs, _ := os.Stat(dest)
-	if destAbs == nil {
-		return false
-	}
-	absDest, _ := os.Getwd()
-	if !os.IsPathSeparator(dest[len(dest)-1]) {
-		absDest = dest + string(os.PathSeparator)
-	} else {
-		absDest = dest
-	}
-	return len(target) >= len(absDest) && target[:len(absDest)] == absDest
-}
-
-// getParentDir returns the parent directory of a given path.
-func getParentDir(path string) string {
-	i := len(path) - 1
-	for i >= 0 && !os.IsPathSeparator(path[i]) {
-		i--
-	}
-	if i > 0 {
-		return path[:i]
-	}
-	return "."
 }
 
 // ZipFolder zips the entire srcDir into destZip (absolute or relative path)
@@ -132,12 +116,6 @@ func ZipFolder(srcDir, destZip string) error {
 
 		// Skip VCS and junk files
 		base := filepath.Base(path)
-		if base == ".git" {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
 		if base == ".DS_Store" || base == "Thumbs.db" {
 			return nil
 		}
@@ -178,5 +156,64 @@ func ZipFolder(srcDir, destZip string) error {
 			return err
 		}
 		return nil
+	})
+}
+
+// CopyDir copies all files and subdirectories from src to dst (dst is created if not exists)
+func CopyDir(src, dst string) error {
+	// Ensure dst exists
+	if err := os.MkdirAll(dst, 0755); err != nil {
+		return err
+	}
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		base := filepath.Base(path)
+		if base == ".git" {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if base == ".DS_Store" || base == "Thumbs.db" {
+			return nil
+		}
+		// Skip symlinks
+		if info.Mode()&os.ModeSymlink != 0 {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, info.Mode())
+		}
+		// Ensure parent dir
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			return err
+		}
+		in, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(out, in); err != nil {
+			out.Close()
+			return err
+		}
+		return out.Close()
 	})
 }

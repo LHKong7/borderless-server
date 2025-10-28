@@ -1,11 +1,20 @@
 package handlers
 
 import (
+	"context"
+	"fmt"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 
+	"borderless_coding_server/config"
 	"borderless_coding_server/internal/models"
 	"borderless_coding_server/internal/services"
+	"borderless_coding_server/pkg/database"
+	"borderless_coding_server/pkg/storage"
+	"borderless_coding_server/pkg/utils"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -439,4 +448,158 @@ func (h *ProjectHandler) GetProjectChatSessions(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"chat_sessions": sessions})
+}
+
+// BuildPreview builds the project and deploys it to static preview folder
+// POST /api/v1/projects/:id/preview
+func (h *ProjectHandler) BuildPreview(c *gin.Context) {
+	// 1. Authenticate user and parse project ID
+	userIDInterface, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+	userID, ok := userIDInterface.(uuid.UUID)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
+	projectIDStr := c.Param("id")
+	projectID, err := uuid.Parse(projectIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid project ID"})
+		return
+	}
+
+	// 2. Get project and check ownership
+	project, err := h.projectService.GetProjectByID(projectID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
+		return
+	}
+	if project.OwnerID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You do not own this project"})
+		return
+	}
+
+	// 3. Check if StorageLocation.NetworkPath exists
+	if project.StorageLocation == nil || project.StorageLocation.NetworkPath == nil || *project.StorageLocation.NetworkPath == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No network path available for this project (project not saved to MinIO yet)"})
+		return
+	}
+	networkPath := *project.StorageLocation.NetworkPath
+
+	// 4. Parse MinIO path (bucket/object)
+	bucket, objectName := parseMinIOPathLocal(networkPath)
+	if bucket == "" || objectName == "" {
+		h.logger.Error("Failed to parse network path: empty bucket or object")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid network path format"})
+		return
+	}
+
+	// 5. Download zip from MinIO to temp file
+	tmpZipFile, err := os.CreateTemp("", "preview-*.zip")
+	if err != nil {
+		h.logger.WithError(err).Error("Failed to create temp zip file")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create temp file"})
+		return
+	}
+	tmpZipPath := tmpZipFile.Name()
+	tmpZipFile.Close()
+	defer os.Remove(tmpZipPath)
+
+	h.logger.Infof("Downloading from MinIO: bucket=%s, object=%s", bucket, objectName)
+	if err := storage.DownloadFile(context.Background(), bucket, objectName, tmpZipPath); err != nil {
+		h.logger.WithError(err).Error("Failed to download zip from MinIO")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to download project from MinIO"})
+		return
+	}
+
+	// 6. Unzip to a temp working directory
+	tmpWorkDir, err := os.MkdirTemp("", "preview-work-*")
+	if err != nil {
+		h.logger.WithError(err).Error("Failed to create temp work dir")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create temp work directory"})
+		return
+	}
+	defer os.RemoveAll(tmpWorkDir)
+
+	h.logger.Infof("Unzipping %s to %s", tmpZipPath, tmpWorkDir)
+	if err := utils.UnZipFile(tmpZipPath, tmpWorkDir); err != nil {
+		h.logger.WithError(err).Error("Failed to unzip project")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unzip project"})
+		return
+	}
+
+	// 7. Run npm install && npm run build
+	h.logger.Infof("Running npm install in %s", tmpWorkDir)
+	installCmd := exec.Command("npm", "install")
+	installCmd.Dir = tmpWorkDir
+	installCmd.Stdout = os.Stdout
+	installCmd.Stderr = os.Stderr
+	if err := installCmd.Run(); err != nil {
+		h.logger.WithError(err).Error("npm install failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "npm install failed"})
+		return
+	}
+
+	h.logger.Infof("Running npm run build in %s", tmpWorkDir)
+	buildCmd := exec.Command("npm", "run", "build")
+	buildCmd.Dir = tmpWorkDir
+	buildCmd.Stdout = os.Stdout
+	buildCmd.Stderr = os.Stderr
+	if err := buildCmd.Run(); err != nil {
+		h.logger.WithError(err).Error("npm run build failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "npm run build failed"})
+		return
+	}
+
+	// 8. Copy dist folder to StaticFolderPath/<project-id>/
+	cfg := config.LoadConfig()
+	staticDest := filepath.Join(cfg.StaticFolderPath, projectID.String())
+	distSrc := filepath.Join(tmpWorkDir, "dist")
+
+	if _, err := os.Stat(distSrc); os.IsNotExist(err) {
+		h.logger.WithError(err).Error("dist folder not found after build")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Build succeeded but dist folder not found"})
+		return
+	}
+
+	// Remove old static files if they exist
+	if err := os.RemoveAll(staticDest); err != nil && !os.IsNotExist(err) {
+		h.logger.WithError(err).Warn("Failed to remove old static files")
+	}
+
+	h.logger.Infof("Copying dist from %s to %s", distSrc, staticDest)
+	if err := utils.CopyDir(distSrc, staticDest); err != nil {
+		h.logger.WithError(err).Error("Failed to copy dist folder")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to copy built files"})
+		return
+	}
+
+	// 9. Update project.preview_url in database
+	previewURL := fmt.Sprintf("/static/%s/index.html", projectID.String())
+	if err := database.DB.Model(&models.Project{}).Where("id = ?", projectID).Update("preview_url", previewURL).Error; err != nil {
+		h.logger.WithError(err).Error("Failed to update preview_url")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update preview URL"})
+		return
+	}
+
+	h.logger.Infof("Preview built successfully for project %s", projectID)
+	c.JSON(http.StatusOK, gin.H{
+		"message":     "Preview built successfully",
+		"preview_url": previewURL,
+	})
+}
+
+// parseMinIOPathLocal parses a path like "bucket/path/to/object.zip" into bucket and object
+// Returns empty strings if invalid
+func parseMinIOPathLocal(p string) (string, string) {
+	for i := 0; i < len(p); i++ {
+		if p[i] == '/' {
+			return p[:i], p[i+1:]
+		}
+	}
+	return "", ""
 }

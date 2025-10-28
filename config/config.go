@@ -58,6 +58,9 @@ type Config struct {
 
 	// Project template zip for initializing new projects
 	ProjectTemplateZip string
+
+	// Static preview folder root (where built assets will be served from)
+	StaticFolderPath string
 }
 
 func LoadConfig() *Config {
@@ -113,6 +116,7 @@ func LoadConfig() *Config {
 		// local storage
 		LocalStoragePath:   getEnv("LOCAL_STORAGE_PATH", "workspaces"),
 		ProjectTemplateZip: getEnv("PROJECT_TEMPLATE_ZIP", "project_template.zip"),
+		StaticFolderPath:   getEnv("STATIC_FOLDER_PATH", "./static_previews"),
 	}
 
 	return config
