@@ -490,7 +490,24 @@ func (h *ProjectHandler) BuildPreview(c *gin.Context) {
 	}
 	networkPath := *project.StorageLocation.NetworkPath
 
-	// 4. Parse MinIO path (bucket/object)
+	// 4. Get working directory from StorageLocation.LocalPath
+	var workDir string
+	if project.StorageLocation.LocalPath != nil && *project.StorageLocation.LocalPath != "" {
+		workDir = *project.StorageLocation.LocalPath
+	} else {
+		// Fallback: use config-based path
+		cfg := config.LoadConfig()
+		workDir = filepath.Join(cfg.LocalStoragePath, userID.String(), projectID.String())
+	}
+
+	// Create working directory if it doesn't exist
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		h.logger.WithError(err).Error("Failed to create working directory")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create working directory"})
+		return
+	}
+
+	// 5. Parse MinIO path (bucket/object)
 	bucket, objectName := parseMinIOPathLocal(networkPath)
 	if bucket == "" || objectName == "" {
 		h.logger.Error("Failed to parse network path: empty bucket or object")
@@ -498,44 +515,36 @@ func (h *ProjectHandler) BuildPreview(c *gin.Context) {
 		return
 	}
 
-	// 5. Download zip from MinIO to temp file
-	tmpZipFile, err := os.CreateTemp("", "preview-*.zip")
-	if err != nil {
-		h.logger.WithError(err).Error("Failed to create temp zip file")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create temp file"})
-		return
-	}
-	tmpZipPath := tmpZipFile.Name()
-	tmpZipFile.Close()
-	defer os.Remove(tmpZipPath)
-
-	h.logger.Infof("Downloading from MinIO: bucket=%s, object=%s", bucket, objectName)
-	if err := storage.DownloadFile(context.Background(), bucket, objectName, tmpZipPath); err != nil {
+	// 6. Download zip from MinIO to project's local path
+	zipPath := filepath.Join(workDir, "project.zip")
+	h.logger.Infof("Downloading from MinIO: bucket=%s, object=%s to %s", bucket, objectName, zipPath)
+	if err := storage.DownloadFile(context.Background(), bucket, objectName, zipPath); err != nil {
 		h.logger.WithError(err).Error("Failed to download zip from MinIO")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to download project from MinIO"})
 		return
 	}
+	defer os.Remove(zipPath) // Clean up zip after unzipping
 
-	// 6. Unzip to a temp working directory
-	tmpWorkDir, err := os.MkdirTemp("", "preview-work-*")
-	if err != nil {
-		h.logger.WithError(err).Error("Failed to create temp work dir")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create temp work directory"})
-		return
-	}
-	defer os.RemoveAll(tmpWorkDir)
-
-	h.logger.Infof("Unzipping %s to %s", tmpZipPath, tmpWorkDir)
-	if err := utils.UnZipFile(tmpZipPath, tmpWorkDir); err != nil {
+	// 7. Unzip the file in the working directory
+	h.logger.Infof("Unzipping %s to %s", zipPath, workDir)
+	if err := utils.UnZipFile(zipPath, workDir); err != nil {
 		h.logger.WithError(err).Error("Failed to unzip project")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unzip project"})
 		return
 	}
 
-	// 7. Run npm install && npm run build
-	h.logger.Infof("Running npm install in %s", tmpWorkDir)
+	// 8. Enter the project-template directory
+	projectTemplateDir := filepath.Join(workDir, "project-template")
+	if _, err := os.Stat(projectTemplateDir); os.IsNotExist(err) {
+		h.logger.WithError(err).Error("project-template directory not found after unzip")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "project-template directory not found after unzip"})
+		return
+	}
+
+	// 9. Run npm install && npm run build in project-template directory
+	h.logger.Infof("Running npm install in %s", projectTemplateDir)
 	installCmd := exec.Command("npm", "install")
-	installCmd.Dir = tmpWorkDir
+	installCmd.Dir = projectTemplateDir
 	installCmd.Stdout = os.Stdout
 	installCmd.Stderr = os.Stderr
 	if err := installCmd.Run(); err != nil {
@@ -544,9 +553,9 @@ func (h *ProjectHandler) BuildPreview(c *gin.Context) {
 		return
 	}
 
-	h.logger.Infof("Running npm run build in %s", tmpWorkDir)
+	h.logger.Infof("Running npm run build in %s", projectTemplateDir)
 	buildCmd := exec.Command("npm", "run", "build")
-	buildCmd.Dir = tmpWorkDir
+	buildCmd.Dir = projectTemplateDir
 	buildCmd.Stdout = os.Stdout
 	buildCmd.Stderr = os.Stderr
 	if err := buildCmd.Run(); err != nil {
@@ -555,10 +564,10 @@ func (h *ProjectHandler) BuildPreview(c *gin.Context) {
 		return
 	}
 
-	// 8. Copy dist folder to StaticFolderPath/<project-id>/
+	// 10. Copy dist folder to StaticFolderPath/<project-id>/
 	cfg := config.LoadConfig()
 	staticDest := filepath.Join(cfg.StaticFolderPath, projectID.String())
-	distSrc := filepath.Join(tmpWorkDir, "dist")
+	distSrc := filepath.Join(projectTemplateDir, "dist")
 
 	if _, err := os.Stat(distSrc); os.IsNotExist(err) {
 		h.logger.WithError(err).Error("dist folder not found after build")
@@ -578,7 +587,7 @@ func (h *ProjectHandler) BuildPreview(c *gin.Context) {
 		return
 	}
 
-	// 9. Update project.preview_url in database
+	// 11. Update project.preview_url in database
 	previewURL := fmt.Sprintf("/static/%s/index.html", projectID.String())
 	if err := database.DB.Model(&models.Project{}).Where("id = ?", projectID).Update("preview_url", previewURL).Error; err != nil {
 		h.logger.WithError(err).Error("Failed to update preview_url")

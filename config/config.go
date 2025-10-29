@@ -116,7 +116,9 @@ func LoadConfig() *Config {
 		// local storage
 		LocalStoragePath:   getEnv("LOCAL_STORAGE_PATH", "workspaces"),
 		ProjectTemplateZip: getEnv("PROJECT_TEMPLATE_ZIP", "project_template.zip"),
-		StaticFolderPath:   getEnv("STATIC_FOLDER_PATH", "./static_previews"),
+
+		// static folder path
+		StaticFolderPath: getEnv("STATIC_FOLDER_PATH", "./static_previews"),
 	}
 
 	return config
